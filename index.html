@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-ECU OTA Update Scheduler</title>
+<style>
+:root{--navy:#173b70;--orange:#ed6b2d;--bg:#f3f6fb;--ink:#17243a;--muted:#64748b;--line:#d9e2ef}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Arial,sans-serif;color:var(--ink)}
+header{background:var(--navy);color:white;padding:25px max(18px,calc((100% - 1100px)/2))}
+header h1{margin:0 0 8px;font-size:clamp(22px,4vw,32px)}header p{margin:0;color:#e3ebf7}
+main{max-width:1100px;margin:22px auto;padding:0 16px}
+.panel{background:white;border:1px solid var(--line);border-radius:13px;padding:18px;margin-bottom:17px;box-shadow:0 3px 12px #19385b0b}
+h2{font-size:19px;margin:0 0 14px;color:var(--navy)}
+.controls{display:flex;gap:12px;align-items:end;flex-wrap:wrap}
+label{font-size:13px;font-weight:700;color:#40516a;display:block;margin-bottom:6px}
+input,select{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:7px;font:inherit;background:white}
+.field{min-width:150px;flex:1}
+button{border:0;border-radius:8px;padding:11px 16px;font-weight:700;cursor:pointer;background:var(--navy);color:white}
+button.secondary{background:#e8eef7;color:var(--navy)}button.orange{background:var(--orange)}
+button:hover{filter:brightness(.96)}
+.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:700px}
+th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
+th{color:#52637b;background:#f7f9fc}
+td input{min-width:75px;padding:8px}td .dep{min-width:140px}
+.remove{background:#fff0ec;color:#b43e18;padding:7px 10px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.metric{background:#edf3fb;border-radius:10px;padding:14px;text-align:center}
+.metric strong{display:block;font-size:25px;color:var(--navy);margin-bottom:4px}
+.metric span{font-size:12px;color:var(--muted)}
+.notice{padding:11px 13px;border-radius:8px;background:#fff5e9;color:#8b4a13;font-size:13px;margin-top:12px}
+.success{background:#eaf7ef;color:#17633a}
+.gantt{display:flex;flex-direction:column;gap:13px}
+.lane{display:grid;grid-template-columns:85px 1fr;gap:10px;align-items:center}
+.lane-name{font-weight:700;font-size:13px}
+.track{height:42px;position:relative;background:repeating-linear-gradient(90deg,#f5f7fa 0,#f5f7fa calc(10% - 1px),#e3e9f1 calc(10% - 1px),#e3e9f1 10%);border-radius:6px;overflow:hidden}
+.bar{position:absolute;top:4px;height:34px;border-radius:5px;background:var(--navy);color:white;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;overflow:hidden;white-space:nowrap;padding:0 3px}
+.bar:nth-child(even){background:var(--orange)}
+.axis{margin-left:95px;display:flex;justify-content:space-between;color:var(--muted);font-size:11px}
+.small{font-size:12px;color:var(--muted);line-height:1.5}
+ol{padding-left:21px}li{margin:7px 0;font-size:14px}
+footer{text-align:center;color:var(--muted);font-size:12px;padding:10px 0 28px}
+@media(max-width:600px){.lane{grid-template-columns:55px 1fr}.axis{margin-left:65px}.panel{padding:14px}}
+</style>
+</head>
+<body>
+<header>
+<h1>Multi-ECU OTA Update Scheduler</h1>
+<p>Partial-order scheduling with resource limits, atomic groups and rollback planning</p>
+</header>
+<main>
+<section class="panel">
+<h2>1. Configure update tasks</h2>
+<div class="controls" style="margin-bottom:14px">
+ <div class="field"><label for="slots">Maximum concurrent flash sessions (k)</label><input id="slots" type="number" min="1" max="20" value="2"></div>
+ <button class="secondary" id="demo">Load project example</button>
+ <button class="orange" id="add">+ Add ECU</button>
+ <button id="run">Generate schedule</button>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th>ECU / Task ID</th><th>Duration (min)</th><th>Predecessors (comma-separated IDs)</th><th>Atomic group (optional)</th><th></th></tr></thead>
+<tbody id="tasks"></tbody></table></div>
+<p class="small">A task can start only after all its predecessor tasks finish. Tasks without a dependency can run in parallel if a flash slot is available. Use the same group name for ECUs that must commit together.</p>
+<div id="message" class="notice" style="display:none"></div>
+</section>
+<section class="panel">
+<h2>2. Schedule summary</h2>
+<div class="metrics">
+ <div class="metric"><strong id="makespan">—</strong><span>Partial-order update time</span></div>
+ <div class="metric"><strong id="serial">—</strong><span>Sequential total time</span></div>
+ <div class="metric"><strong id="saving">—</strong><span>Time reduction</span></div>
+ <div class="metric"><strong id="count">—</strong><span>ECUs scheduled</span></div>
+</div>
+<p class="small" id="summary">Load the example or enter ECU tasks, then select “Generate schedule”.</p>
+</section>
+<section class="panel">
+<h2>3. Gantt chart – concurrent flash sessions</h2>
+<div id="chart" class="gantt"><p class="small">The schedule chart will appear here.</p></div>
+</section>
+<section class="panel">
+<h2>4. Update order and rollback plan</h2>
+<div class="controls">
+ <div style="flex:1;min-width:250px"><h3 style="font-size:15px;color:var(--navy)">Forward update order</h3><ol id="forward"><li class="small">Waiting for schedule.</li></ol></div>
+ <div style="flex:1;min-width:250px"><h3 style="font-size:15px;color:var(--orange)">Rollback order</h3><ol id="rollback"><li class="small">Waiting for schedule.</li></ol></div>
+</div>
+<p class="small">Rollback is listed in reverse completion order. For an atomic group, all members are treated as one commit unit; if a member fails, the group returns to its previous firmware version. This is a planning demonstration, not a connection to a real vehicle or ECU.</p>
+</section>
+<section class="panel">
+<h2>5. Algorithm used</h2>
+<ol>
+<li>Build a directed dependency graph from the predecessor entries.</li>
+<li>Check that the graph is valid and contains no dependency cycle.</li>
+<li>Calculate each task's critical-path rank (its duration plus the longest dependent chain).</li>
+<li>Start ready tasks in highest-rank order while respecting the maximum number of flash sessions.</li>
+<li>Display the schedule, total duration and reverse-order rollback plan.</li>
+</ol>
+</section>
+<footer>Academic project prototype · Partial-order OTA scheduling simulator</footer>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let tasks=[];
+function addTask(id='',duration=1,deps='',group=''){
+ const tr=document.createElement('tr');
+ tr.innerHTML=`<td><input class="tid" value="${id}" placeholder="e.g. GW"></td>
+ <td><input class="dur" type="number" min="0.1" step="0.1" value="${duration}"></td>
+ <td><input class="dep" value="${deps}" placeholder="e.g. GW, BMS"></td>
+ <td><input class="grp" value="${group}" placeholder="e.g. POWER"></td>
+ <td><button class="remove" type="button">Remove</button></td>`;
+ tr.querySelector('.remove').onclick=()=>tr.remove();$('tasks').appendChild(tr);
+}
+function loadDemo(){
+ $('tasks').innerHTML='';
+ addTask('GW',2,'','');
+ addTask('BMS',5,'','POWER');
+ addTask('IVI',10,'GW','');
+ addTask('ADAS',8,'GW','');
+ addTask('BCM',3,'GW','');
+ addTask('MCU',6,'BMS','POWER');
+ $('slots').value=2;$('message').style.display='none';generate();
+}
+function readTasks(){
+ const rows=[...$('tasks').querySelectorAll('tr')];
+ return rows.map(r=>({id:r.querySelector('.tid').value.trim(),d:Number(r.querySelector('.dur').value),
+ deps:r.querySelector('.dep').value.split(',').map(x=>x.trim()).filter(Boolean),
+ group:r.querySelector('.grp').value.trim()}));
+}
+function fail(msg){$('message').textContent=msg;$('message').className='notice';$('message').style.display='block';}
+function generate(){
+ const ts=readTasks(),k=Number($('slots').value);
+ $('message').style.display='none';
+ if(!ts.length)return fail('Add at least one ECU task.');
+ if(!Number.isInteger(k)||k<1)return fail('Maximum concurrent sessions must be a positive whole number.');
+ const map=new Map();
+ for(const t of ts){if(!t.id)return fail('Every ECU must have a task ID.');if(map.has(t.id))return fail('Duplicate task ID: '+t.id);if(!(t.d>0)||!Number.isFinite(t.d))return fail('Each duration must be greater than zero.');map.set(t.id,t);}
+ for(const t of ts)for(const p of t.deps)if(!map.has(p))return fail(`Unknown predecessor "${p}" used by ${t.id}.`);
+ for(const t of ts)if(t.deps.includes(t.id))return fail(`${t.id} cannot depend on itself.`);
+ // Critical-path ranks, calculated recursively with cycle detection.
+ const rank={},visiting=new Set(),done=new Set();
+ function getRank(id){
+  if(visiting.has(id))throw Error('Dependency cycle detected. The dependency graph must be acyclic.');
+  if(done.has(id))return rank[id];
+  visiting.add(id);const t=map.get(id);
+  const childRanks=ts.filter(x=>x.deps.includes(id)).map(x=>getRank(x.id));
+  rank[id]=t.d+(childRanks.length?Math.max(...childRanks):0);
+  visiting.delete(id);done.add(id);return rank[id];
+ }
+ try{ts.forEach(t=>getRank(t.id));}catch(e){return fail(e.message);}
+ // List schedule: select highest critical-path rank among ready tasks.
+ const scheduled={},running=[],completed=new Set(),timeline=[];
+ let now=0,guard=0;
+ while(completed.size<ts.length){
+  guard++;if(guard>ts.length*ts.length+100)return fail('Unable to construct schedule; check task dependencies.');
+  // Finish all tasks ending now.
+  for(let i=running.length-1;i>=0;i--)if(running[i].end<=now+1e-9){completed.add(running[i].id);running.splice(i,1);}
+  const ready=ts.filter(t=>!scheduled[t.id]&&t.deps.every(d=>completed.has(d)))
+    .sort((a,b)=>rank[b.id]-rank[a.id]||a.id.localeCompare(b.id));
+  while(running.length<k&&ready.length){
+   const t=ready.shift(),start=now,end=start+t.d;
+   scheduled[t.id]={id:t.id,start,end,d:t.d,group:t.group,rank:rank[t.id]};
+   running.push({id:t.id,end});timeline.push(scheduled[t.id]);
+  }
+  if(completed.size===ts.length)break;
+  if(!running.length)return fail('No task can run. Check the dependency graph.');
+  now=Math.min(...running.map(x=>x.end));
+ }
+ const makespan=Math.max(...timeline.map(x=>x.end)),serial=ts.reduce((s,t)=>s+t.d,0);
+ $('makespan').textContent=makespan.toFixed(1)+' min';
+ $('serial').textContent=serial.toFixed(1)+' min';
+ $('saving').textContent=(100*(serial-makespan)/serial).toFixed(1)+'%';
+ $('count').textContent=ts.length;
+ $('summary').textContent=`${ts.length} ECU tasks scheduled across ${k} concurrent flash session(s). The schedule completes at ${makespan.toFixed(1)} minutes.`;
+ drawChart(timeline,k,makespan);
+ const ordered=[...timeline].sort((a,b)=>a.start-b.start||a.end-b.end||a.id.localeCompare(b.id));
+ $('forward').innerHTML=ordered.map(t=>`<li><b>${esc(t.id)}</b> — ${t.start.toFixed(1)} to ${t.end.toFixed(1)} min${t.group?' · group '+esc(t.group):''}</li>`).join('');
+ $('rollback').innerHTML=[...ordered].reverse().map(t=>`<li><b>${esc(t.id)}</b> — revert to previous firmware${t.group?' · group '+esc(t.group):''}</li>`).join('');
+ $('message').textContent='Schedule generated successfully. The chart is an illustrative software simulation; it does not flash firmware or control vehicle hardware.';
+ $('message').className='notice success';$('message').style.display='block';
+}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function drawChart(items,k,total){
+ const chart=$('chart');chart.innerHTML='';
+ const lanes=Array.from({length:k},()=>[]);
+ // Assign each task to the first available lane; schedule is already resource limited.
+ const sorted=[...items].sort((a,b)=>a.start-b.start||a.end-b.end);
+ sorted.forEach(t=>{
+  let lane=lanes.findIndex(arr=>!arr.length||arr[arr.length-1].end<=t.start+1e-9);
+  if(lane<0)lane=0;lanes[lane].push(t);t.lane=lane;
+ });
+ lanes.forEach((arr,i)=>{
+  const row=document.createElement('div');row.className='lane';
+  const name=document.createElement('div');name.className='lane-name';name.textContent='Slot '+(i+1);
+  const track=document.createElement('div');track.className='track';
+  arr.forEach((t,j)=>{
+   const bar=document.createElement('div');bar.className='bar';
+   bar.style.left=(t.start/total*100)+'%';bar.style.width=(t.d/total*100)+'%';
+   bar.title=`${t.id}: ${t.start}–${t.end} min`;bar.textContent=`${t.id} (${t.d}m)`;track.appendChild(bar);
+  });
+  row.append(name,track);chart.appendChild(row);
+ });
+ const axis=document.createElement('div');axis.className='axis';
+ for(let i=0;i<=5;i++){const s=document.createElement('span');s.textContent=(total*i/5).toFixed(0)+' min';axis.appendChild(s);}chart.appendChild(axis);
+}
+$('add').onclick=()=>addTask('ECU'+($('tasks').children.length+1),4,'','');
+$('demo').onclick=loadDemo;$('run').onclick=generate;
+loadDemo();
+</script>
+</body>
+</html>
